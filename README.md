@@ -1,9 +1,14 @@
-# SQLite 复现库缩减服务
+# SQLite 复现库缩减 / 脚本依赖核查服务
 
 入仓开发者排查 SQL 失败时，用它把精简后的**复现库**交给同事：上传一个结构受限、
 外键有效的 SQLite 数据库和一段确定性 SQL 脚本，服务先确认原始错误，再在保持
 表结构与剩余行值不变、外键始终有效的前提下删除数据行，直到得到 **1-最小**
 复现库——删除任意一行（连同直接或间接引用它的全部行）后都无法再复现同一错误。
+
+数仓值班工程师安排入仓 SQL 前，还可以使用**脚本依赖核查**：上传同样约束的
+SQLite 库，按既定顺序提交 2～4 段 SQL，服务**只分析不运行**，识别每条语句
+读取、写入的表（外键约束引起的隐含读取同样计入），按提交顺序建立读写/写写
+冲突的先后关系，并给出依赖上可并行的批次。
 
 ## 复现判定（严格）
 
@@ -51,6 +56,45 @@
    直到一整轮没有任何可删集合——即满足 1-最小性；
 3. 产出最终库后再跑一次脚本，确认错误码与完整错误文本与基线一致。
 
+## 脚本依赖核查（只分析、不运行）
+
+页面第二个标签页“脚本依赖核查”面向入仓前的依赖确认，与缩减入口共用同一套
+上传库约束，原库与已有缩减结果都不会被修改。
+
+### 允许的语句
+
+| 类别 | 语句 |
+| --- | --- |
+| 查询 | `SELECT`、`VALUES`、`WITH ... SELECT`（支持 WITH 子查询/CTE） |
+| 增删改现有表数据 | `INSERT`、`UPDATE`、`DELETE`、`REPLACE`（含 `ON CONFLICT` 与 `INSERT ... SELECT`） |
+| 事务控制 | `BEGIN`（含 DEFERRED/IMMEDIATE/EXCLUSIVE）、`COMMIT`/`END`、`ROLLBACK`、`SAVEPOINT`、`RELEASE` |
+
+DDL（CREATE/ALTER/DROP）、ATTACH/DETACH、非 `foreign_keys` 的 PRAGMA、扩展与
+外部文件函数等一律拒绝；无法判定的语句（如引用不存在的表）会指出**语句序号与
+行列位置**，并且不输出任何部分排程。
+
+### 分析原理
+
+1. 用 `sqlite3.complete_statement` 按提交顺序切出 2～4 条完整语句（跳过注释）；
+2. 库以 **只读 URI** 打开，每条数据语句仅执行 `EXPLAIN <stmt>` 做语句准备，
+   **准备不等于执行**，不触碰任何表数据；
+3. 准备期 authorizer 上报 `SQLITE_READ/INSERT/UPDATE/DELETE` 事件，得到显式
+   读/写的表与列；CTE 内部对象通过库名/触发器名参数过滤，不会误判为表；
+4. 连接强制 `PRAGMA foreign_keys=ON`，authorizer 会原生上报**外键隐含读取**，
+   同时按 schema 外键定义独立推导一份并合并：
+   * 插入子表、更新子表外键/主键 → 隐含读父表被引用主键列；
+   * 删除行、更新父表主键 → 隐含读所有子表外键列；自引用外键同样计入；
+   * 仅更新普通非键列不产生隐含读取；
+5. 按提交顺序，两条语句在同一表上只要有一方是写即建立先后边
+   （写-读 `write-read` / 写-写 `write-write`，纯读-读不建边），再做拓扑分层，
+   得到层内无冲突、**依赖上可并行**的批次。
+
+### 结果内容
+
+* 每条语句的类型、原文、读取表（标注外键隐含表与隐含列）、写入表与列明细；
+* 冲突边清单：先执行语句 → 后执行语句、冲突表、冲突类型；
+* 并行批次：同一批次内的语句无共享写表、无写-读表重叠，可并行；批次间串行。
+
 ## 快速开始（Docker Compose）
 
 ```bash
@@ -74,7 +118,7 @@ docker compose down -v       # 同时删除任务数据卷
 python3 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
 DATA_DIR=./data .venv/bin/uvicorn app.main:app --reload --port 8000
-.venv/bin/pytest             # 48 个测试
+.venv/bin/pytest             # 80 个测试
 ```
 
 ## 内置样例
@@ -102,28 +146,30 @@ DATA_DIR=./data .venv/bin/uvicorn app.main:app --reload --port 8000
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/` | 单页前端 |
+| GET | `/` | 单页前端（含“复现库缩减”“脚本依赖核查”两个标签页） |
 | GET | `/api/samples` | 内置样例清单与下载地址 |
 | POST | `/api/jobs` | 表单字段 `db`（必填）、`sql`（文件）或 `script_text`（文本），返回 202 与任务 id |
 | GET | `/api/jobs/{id}` | 查询任务状态、错误指纹、行数变化、保留行与缩减日志 |
 | GET | `/api/jobs/{id}/download` | 下载复现库 `repro.db`（仅缩减成功时可用） |
+| POST | `/api/dependency-check` | 脚本依赖核查：字段 `db`、重复字段 `statements`（2～4 段）或 `script_text`（整段文本按分号切分）；同步返回每条语句读写表、冲突边与并行批次；无法判定时 400 并带语句序号/行列位置，不返回部分排程 |
 
 ## 目录结构
 
 ```
 app/
   config.py        # 约束与运行配置
-  errors.py        # 业务异常
+  errors.py        # 业务异常（含 DependencyRejected 位置信息）
   validation.py    # 库结构/行/外键图校验
   script_guard.py  # 脚本静态检查
+  dependency.py    # 脚本依赖核查：语句切分、EXPLAIN+authorizer 读写分析、外键隐含读取、冲突边与并行批次
   runner.py        # 规范副本、authorizer、独立副本试跑、确定性双跑
   reducer.py       # ddmin + 逐行闭包终检
   jobs.py          # 后台任务与并发/TTL 管理
   service.py       # 上传->校验->确认->缩减 流水线
   samples.py       # 内置样例生成
-  main.py          # FastAPI 路由
+  main.py          # FastAPI 路由（缩减任务 + /api/dependency-check）
   static/index.html
-tests/             # 48 个单元/集成/端到端测试
+tests/             # 单元/集成/端到端测试（80 个）
 Dockerfile
 docker-compose.yml
 ```
